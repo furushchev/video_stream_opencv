@@ -59,6 +59,7 @@ class VideoStreamNodelet: public nodelet::Nodelet {
 protected:
 boost::shared_ptr<ros::NodeHandle> nh, pnh;
 image_transport::CameraPublisher pub;
+ros::Publisher pub_raw, pub_info; // for use_raw_data
 boost::shared_ptr<dynamic_reconfigure::Server<VideoStreamConfig> > dyn_srv;
 std::mutex q_mutex, s_mutex;
 std::queue<cv::Mat> framesQueue;
@@ -80,35 +81,35 @@ bool flip_horizontal;
 bool flip_vertical;
 bool capture_thread_running;
 bool reopen_on_read_failure;
+bool use_raw_data;
 boost::thread capture_thread;
 ros::Timer publish_timer;
 sensor_msgs::CameraInfo cam_info_msg;
 
 // Based on the ros tutorial on transforming opencv images to Image messages
 
-virtual sensor_msgs::CameraInfo get_default_camera_info_from_image(sensor_msgs::ImagePtr img){
+virtual sensor_msgs::CameraInfo get_default_camera_info(
+    const std::string &frame_id, const int width, const int height) const {
     sensor_msgs::CameraInfo cam_info_msg;
-    cam_info_msg.header.frame_id = img->header.frame_id;
+    cam_info_msg.header.frame_id = frame_id;
     // Fill image size
-    cam_info_msg.height = img->height;
-    cam_info_msg.width = img->width;
-    NODELET_INFO_STREAM("The image width is: " << img->width);
-    NODELET_INFO_STREAM("The image height is: " << img->height);
+    cam_info_msg.height = height;
+    cam_info_msg.width = width;
     // Add the most common distortion model as sensor_msgs/CameraInfo says
     cam_info_msg.distortion_model = "plumb_bob";
     // Don't let distorsion matrix be empty
     cam_info_msg.D.resize(5, 0.0);
     // Give a reasonable default intrinsic camera matrix
-    cam_info_msg.K = boost::assign::list_of(1.0) (0.0) (img->width/2.0)
-            (0.0) (1.0) (img->height/2.0)
+    cam_info_msg.K = boost::assign::list_of(1.0) (0.0) (width/2.0)
+            (0.0) (1.0) (height/2.0)
             (0.0) (0.0) (1.0);
     // Give a reasonable default rectification matrix
     cam_info_msg.R = boost::assign::list_of (1.0) (0.0) (0.0)
             (0.0) (1.0) (0.0)
             (0.0) (0.0) (1.0);
     // Give a reasonable default projection matrix
-    cam_info_msg.P = boost::assign::list_of (1.0) (0.0) (img->width/2.0) (0.0)
-            (0.0) (1.0) (img->height/2.0) (0.0)
+    cam_info_msg.P = boost::assign::list_of (1.0) (0.0) (width/2.0) (0.0)
+            (0.0) (1.0) (height/2.0) (0.0)
             (0.0) (0.0) (1.0) (0.0);
     return cam_info_msg;
 }
@@ -174,7 +175,6 @@ virtual void do_capture() {
 
 virtual void do_publish(const ros::TimerEvent& event) {
     bool is_new_image = false;
-    sensor_msgs::ImagePtr msg;
     std_msgs::Header header;
     header.frame_id = frame_id;
     {
@@ -188,6 +188,22 @@ virtual void do_publish(const ros::TimerEvent& event) {
 
     // Check if grabbed frame is actually filled with some content
     if(!frame.empty()) {
+      if (use_raw_data) {
+        sensor_msgs::CompressedImage msg;
+        msg.header = header;
+        msg.header.stamp = ros::Time::now();
+        msg.format = "bgr8; jpeg compressed"; // FIXME: hardcoded
+        msg.data = frame;
+        pub_raw.publish(msg);
+        if (cam_info_msg.distortion_model == ""){
+          const int width = cap->get(CV_CAP_PROP_FRAME_WIDTH);
+          const int height = cap->get(CV_CAP_PROP_FRAME_HEIGHT);
+          cam_info_msg = get_default_camera_info(msg.header.frame_id, width, height);
+        }
+        cam_info_msg.header.stamp = msg.header.stamp;
+        pub_raw.publish(msg);
+        pub_info.publish(cam_info_msg);
+      } else {
         // From http://docs.opencv.org/modules/core/doc/operations_on_arrays.html#void flip(InputArray src, OutputArray dst, int flipCode)
         // FLIP_HORIZONTAL == 1, FLIP_VERTICAL == 0 or FLIP_BOTH == -1
         // Flip the image if necessary
@@ -199,15 +215,15 @@ virtual void do_publish(const ros::TimerEvent& event) {
           else if (flip_vertical)
             cv::flip(frame, frame, 0);
         }
-        msg = cv_bridge::CvImage(header, "bgr8", frame).toImageMsg();
+        sensor_msgs::Image::Ptr msg = cv_bridge::CvImage(header, "bgr8", frame).toImageMsg();
         // Create a default camera info if we didn't get a stored one on initialization
         if (cam_info_msg.distortion_model == ""){
             NODELET_WARN_STREAM("No calibration file given, publishing a reasonable default camera info.");
-            cam_info_msg = get_default_camera_info_from_image(msg);
-            // cam_info_manager.setCameraInfo(cam_info_msg);
+            cam_info_msg = get_default_camera_info(msg->header.frame_id, msg->width, msg->height);
         }
         // The timestamps are in sync thanks to this publisher
         pub.publish(*msg, cam_info_msg, ros::Time::now());
+      }
     }
 }
 
@@ -291,7 +307,7 @@ virtual void connectionCallback(const image_transport::SingleSubscriberPublisher
   connectionCallbackImpl();
 }
 
-virtual void infoConnectionCallback(const ros::SingleSubscriberPublisher&) {
+virtual void rosConnectionCallback(const ros::SingleSubscriberPublisher&) {
   connectionCallbackImpl();
 }
 
@@ -299,7 +315,7 @@ virtual void disconnectionCallback(const image_transport::SingleSubscriberPublis
   disconnectionCallbackImpl();
 }
 
-virtual void infoDisconnectionCallback(const ros::SingleSubscriberPublisher&) {
+virtual void rosDisconnectionCallback(const ros::SingleSubscriberPublisher&) {
   disconnectionCallbackImpl();
 }
 
@@ -373,6 +389,50 @@ virtual void configCallback(VideoStreamConfig& config, uint32_t level) {
         cap->set(CV_CAP_PROP_AUTO_EXPOSURE, 0.25);
         cap->set(CV_CAP_PROP_EXPOSURE, config.exposure);
       }
+      if (!config.fourcc.empty()) {
+        if (config.fourcc.size() != 4) {
+          NODELET_ERROR_STREAM("Invalid fourcc (length " << config.fourcc.size() << " != 4");
+          config.fourcc = std::string();
+        } else {
+          double fourcc = CV_FOURCC(
+              config.fourcc[0], config.fourcc[1], config.fourcc[2], config.fourcc[3]);
+          cap->set(CV_CAP_PROP_FOURCC, fourcc);
+        }
+      }
+      if (use_raw_data != config.use_raw_data)
+      {
+        use_raw_data = config.use_raw_data;
+        cap->set(CV_CAP_PROP_CONVERT_RGB, config.use_raw_data ? 0.0 : 1.0);
+        ros::SubscriberStatusCallback info_connect_cb =
+          boost::bind(&VideoStreamNodelet::rosConnectionCallback, this, _1);
+        ros::SubscriberStatusCallback info_disconnect_cb =
+          boost::bind(&VideoStreamNodelet::rosDisconnectionCallback, this, _1);
+        if (use_raw_data) {
+          if (pub) pub.shutdown();
+          ros::SubscriberStatusCallback connect_cb =
+            boost::bind(&VideoStreamNodelet::rosConnectionCallback, this, _1);
+          ros::SubscriberStatusCallback disconnect_cb =
+            boost::bind(&VideoStreamNodelet::rosDisconnectionCallback, this, _1);
+          pub_raw = nh->advertise<sensor_msgs::CompressedImage>(
+              "image_raw/compressed", 1, connect_cb, connect_cb);
+          pub_info = nh->advertise<sensor_msgs::CameraInfo>(
+              "camera_info", 1, info_connect_cb, info_connect_cb);
+        } else {
+          if (pub_raw) {
+            pub_raw.shutdown();
+            pub_info.shutdown();
+          }
+          image_transport::SubscriberStatusCallback connect_cb =
+            boost::bind(&VideoStreamNodelet::connectionCallback, this, _1);
+          image_transport::SubscriberStatusCallback disconnect_cb =
+            boost::bind(&VideoStreamNodelet::disconnectionCallback, this, _1);
+          pub = image_transport::ImageTransport(*nh).advertiseCamera(
+              "image_raw", 1,
+              connect_cb, connect_cb,
+              info_connect_cb, info_connect_cb,
+              ros::VoidPtr(), false);
+        }
+      }
     }
 
     loop_videofile = config.loop_videofile;
@@ -388,6 +448,7 @@ virtual void onInit() {
     nh.reset(new ros::NodeHandle(getNodeHandle()));
     pnh.reset(new ros::NodeHandle(getPrivateNodeHandle()));
     subscriber_num = 0;
+    use_raw_data = false;
 
     // provider can be an url (e.g.: rtsp://10.0.0.1:554) or a number of device, (e.g.: 0 would be /dev/video0)
     pnh->param<std::string>("video_stream_provider", video_stream_provider, "0");
@@ -425,19 +486,30 @@ virtual void onInit() {
     dyn_srv->setCallback(f);
 
     subscriber_num = 0;
-    image_transport::SubscriberStatusCallback connect_cb =
-      boost::bind(&VideoStreamNodelet::connectionCallback, this, _1);
     ros::SubscriberStatusCallback info_connect_cb =
-      boost::bind(&VideoStreamNodelet::infoConnectionCallback, this, _1);
-    image_transport::SubscriberStatusCallback disconnect_cb =
-      boost::bind(&VideoStreamNodelet::disconnectionCallback, this, _1);
+      boost::bind(&VideoStreamNodelet::rosConnectionCallback, this, _1);
     ros::SubscriberStatusCallback info_disconnect_cb =
-      boost::bind(&VideoStreamNodelet::infoDisconnectionCallback, this, _1);
-    pub = image_transport::ImageTransport(*nh).advertiseCamera(
-      "image_raw", 1,
-      connect_cb, connect_cb,
-      info_connect_cb, info_connect_cb,
-      ros::VoidPtr(), false);
+      boost::bind(&VideoStreamNodelet::rosDisconnectionCallback, this, _1);
+    if (use_raw_data) {
+      ros::SubscriberStatusCallback connect_cb =
+        boost::bind(&VideoStreamNodelet::rosConnectionCallback, this, _1);
+      ros::SubscriberStatusCallback disconnect_cb =
+        boost::bind(&VideoStreamNodelet::rosDisconnectionCallback, this, _1);
+      pub_raw = nh->advertise<sensor_msgs::CompressedImage>(
+          "image_raw/compressed", 1, connect_cb, connect_cb);
+      pub_info = nh->advertise<sensor_msgs::CameraInfo>(
+          "camera_info", 1, info_connect_cb, info_connect_cb);
+    } else {
+      image_transport::SubscriberStatusCallback connect_cb =
+        boost::bind(&VideoStreamNodelet::connectionCallback, this, _1);
+      image_transport::SubscriberStatusCallback disconnect_cb =
+        boost::bind(&VideoStreamNodelet::disconnectionCallback, this, _1);
+      pub = image_transport::ImageTransport(*nh).advertiseCamera(
+          "image_raw", 1,
+          connect_cb, connect_cb,
+          info_connect_cb, info_connect_cb,
+          ros::VoidPtr(), false);
+    }
 }
 
 virtual ~VideoStreamNodelet() {
