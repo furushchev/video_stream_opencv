@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 2.8.3)
 project(video_stream_opencv)
-add_definitions(-std=c++11)
+
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 14)
+endif()
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
